@@ -1,6 +1,6 @@
 # media-report-automation
 
-Projeto base robusto para automação de relatórios de mídia: ingestão de planilha Excel, cálculo de KPIs de investimento, geração de visualizações e exportação de apresentação executiva em PowerPoint.
+Projeto base robusto para automação de relatórios de mídia: ingestão de planilha, cálculo de KPIs de investimento, geração de visualizações e exportação de apresentação executiva em PowerPoint.
 
 ## Estrutura do projeto
 
@@ -8,7 +8,8 @@ Projeto base robusto para automação de relatórios de mídia: ingestão de pla
 media-report-automation/
 ├── data/
 ├── scripts/
-│   └── analyze_campaign.py
+│   ├── analyze_campaign.py
+│   └── generate_mock_campaign.py
 ├── output/
 └── README.md
 ```
@@ -26,61 +27,76 @@ Apoiar rotinas de análise para times de mídia/performance, criando um fluxo re
 
 - Python 3.9+
 - Bibliotecas:
-  - `pandas`
   - `matplotlib`
   - `python-pptx`
-  - `openpyxl`
+  - `openpyxl` (necessário para entrada/saída `.xlsx`)
 
 Instalação sugerida:
 
 ```bash
-pip install pandas matplotlib python-pptx openpyxl
+pip install matplotlib python-pptx openpyxl
 ```
 
-## Formato da planilha de entrada
+## Formato da base de entrada
 
-Arquivo Excel (`.xlsx`) com colunas obrigatórias:
+Colunas obrigatórias:
 
 - `Canal`
 - `Investimento`
 
-Exemplo:
+Formato suportado:
 
-| Canal    | Investimento |
-|----------|--------------|
-| TV       | 150000       |
-| Search   | 80000        |
-| Social   | 120000       |
+- `.csv` (recomendado para simulação rápida)
+- `.xlsx` (quando disponível)
 
-## Execução
+## Execução com dados fictícios (exploração antes dos dados reais)
 
-Execução mínima:
+### 1) Gerar base mock automaticamente
 
 ```bash
-python scripts/analyze_campaign.py --input data/campanha.xlsx
+python scripts/generate_mock_campaign.py
 ```
 
-Execução recomendada (contexto executivo):
+Arquivos gerados:
+
+- `data/campanha_ficticia.csv`
+- `data/campanha_ficticia.xlsx` (se `openpyxl` estiver disponível)
+
+### 2) Rodar análise automatizada com a base mock
 
 ```bash
 python scripts/analyze_campaign.py \
-  --input data/campanha.xlsx \
-  --sheet "Resumo" \
+  --input data/campanha_ficticia.csv \
   --output-dir output \
-  --title "Share de Investimento por Canal" \
-  --campaign "Lançamento Q1" \
-  --period "Jan-Mar/2026"
+  --title "Share de Investimento - Campanha Fictícia" \
+  --campaign "Campanha Potência (simulação)" \
+  --period "Q1/2026"
+```
+
+## Execução com dados reais
+
+```bash
+python scripts/analyze_campaign.py --input data/campanha_real.xlsx --sheet "Resumo"
 ```
 
 ## Parâmetros disponíveis
 
-- `--input`: caminho do arquivo Excel (obrigatório)
-- `--sheet`: nome da aba (opcional; padrão = primeira)
+### `scripts/analyze_campaign.py`
+
+- `--input`: caminho do arquivo de entrada (`.csv` ou `.xlsx`) (obrigatório)
+- `--sheet`: nome da aba quando a entrada for `.xlsx` (padrão = `Resumo`)
 - `--output-dir`: diretório de saída (padrão = `output`)
 - `--title`: título principal dos gráficos e relatório
 - `--campaign`: nome da campanha para o slide executivo
 - `--period`: período de análise
 - `--log-level`: nível de log (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
+
+### `scripts/generate_mock_campaign.py`
+
+- `--output-csv`: caminho do CSV fictício (padrão: `data/campanha_ficticia.csv`)
+- `--output-xlsx`: caminho do XLSX fictício (padrão: `data/campanha_ficticia.xlsx`)
+- `--sheet`: nome da aba no XLSX (padrão: `Resumo`)
+- `--skip-xlsx`: gera apenas CSV
 
 ## KPIs calculados
 
@@ -100,10 +116,3 @@ python scripts/analyze_campaign.py \
 - `investment_share_pie.png` → gráfico de pizza
 - `investment_share_bar.png` → gráfico de barras de investimento
 - `investment_share_report.pptx` → apresentação executiva com KPIs e gráficos
-
-## Próximos passos sugeridos
-
-- Adicionar integração com APIs de mídia (Meta, Google Ads, DV360 etc.) para coleta automática.
-- Incluir comparação de períodos (MoM, QoQ).
-- Incorporar métricas de performance (CPM, CPC, CPA, ROAS) quando disponíveis.
-- Agendar execução recorrente via CI/CD ou orquestrador (Airflow, cron, GitHub Actions).

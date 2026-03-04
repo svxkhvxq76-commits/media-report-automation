@@ -4,14 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 import matplotlib.pyplot as plt
-import pandas as pd
 from pptx import Presentation
 from pptx.util import Inches, Pt
 
@@ -30,6 +32,16 @@ class KPIBundle:
 
 
 @dataclass
+class RankingRow:
+    canal: str
+    investimento: float
+    share: float
+    share_percentual: float
+    investimento_acumulado: float
+    share_acumulado: float
+
+
+@dataclass
 class ReportArtifacts:
     base_processada_csv: Path
     ranking_canais_csv: Path
@@ -43,12 +55,12 @@ class ReportArtifacts:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Lê uma planilha Excel com Canal e Investimento, calcula KPIs de distribuição de verba, "
+            "Lê uma planilha (.xlsx) ou CSV com Canal e Investimento, calcula KPIs, "
             "gera visualizações e exporta um relatório em PowerPoint."
         )
     )
-    parser.add_argument("--input", required=True, help="Caminho do arquivo Excel de entrada (.xlsx).")
-    parser.add_argument("--sheet", default=None, help="Nome da aba a ser lida (padrão: primeira aba).")
+    parser.add_argument("--input", required=True, help="Caminho do arquivo de entrada (.xlsx ou .csv).")
+    parser.add_argument("--sheet", default="Resumo", help="Nome da aba para .xlsx (padrão: Resumo).")
     parser.add_argument("--output-dir", default="output", help="Diretório para arquivos gerados.")
     parser.add_argument("--title", default="Share de Investimento por Canal", help="Título principal do relatório.")
     parser.add_argument("--campaign", default="Campanha não informada", help="Nome da campanha para contextualização.")
@@ -58,83 +70,160 @@ def parse_args() -> argparse.Namespace:
 
 
 def setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level),
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
+    logging.basicConfig(level=getattr(logging, level), format="%(asctime)s | %(levelname)s | %(message)s")
 
 
-def load_and_validate_data(excel_path: Path, sheet_name: str | None) -> pd.DataFrame:
-    logging.info("Lendo arquivo: %s", excel_path)
-    df = pd.read_excel(excel_path, sheet_name=sheet_name)
+def _load_rows_from_csv(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as fp:
+        reader = csv.DictReader(fp)
+        return [dict(row) for row in reader]
 
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+
+def _load_rows_from_xlsx(path: Path, sheet_name: str) -> list[dict[str, str]]:
+    try:
+        from openpyxl import load_workbook
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("Para ler .xlsx instale openpyxl: pip install openpyxl") from exc
+
+    workbook = load_workbook(path, data_only=True)
+    if sheet_name not in workbook.sheetnames:
+        raise ValueError(f"Aba '{sheet_name}' não encontrada. Abas disponíveis: {workbook.sheetnames}")
+
+    sheet = workbook[sheet_name]
+    rows = list(sheet.iter_rows(values_only=True))
+    if not rows:
+        return []
+
+    headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+    out: list[dict[str, str]] = []
+    for values in rows[1:]:
+        record = {}
+        for idx, header in enumerate(headers):
+            if not header:
+                continue
+            record[header] = "" if idx >= len(values) or values[idx] is None else str(values[idx]).strip()
+        out.append(record)
+    return out
+
+
+def _validate_columns(rows: list[dict[str, str]]) -> None:
+    if not rows:
+        raise ValueError("Arquivo sem linhas de dados.")
+    header_set = set(rows[0].keys())
+    missing = [column for column in REQUIRED_COLUMNS if column not in header_set]
     if missing:
         raise ValueError(f"Colunas obrigatórias ausentes: {missing}")
 
-    working = df[REQUIRED_COLUMNS].copy()
-    working["Canal"] = working["Canal"].astype(str).str.strip()
-    working["Investimento"] = pd.to_numeric(working["Investimento"], errors="coerce")
-    working = working.dropna(subset=["Canal", "Investimento"])
-    working = working[working["Canal"] != ""]
 
-    if working.empty:
-        raise ValueError("Não há dados válidos após limpeza da planilha.")
+def load_and_validate_data(input_path: Path, sheet_name: str) -> list[dict[str, float | str]]:
+    logging.info("Lendo arquivo: %s", input_path)
 
-    if (working["Investimento"] < 0).any():
-        raise ValueError("Foram encontrados valores negativos de investimento.")
+    suffix = input_path.suffix.lower()
+    if suffix == ".csv":
+        raw_rows = _load_rows_from_csv(input_path)
+    elif suffix == ".xlsx":
+        raw_rows = _load_rows_from_xlsx(input_path, sheet_name)
+    else:
+        raise ValueError("Formato não suportado. Use .csv ou .xlsx")
 
-    logging.info("Linhas válidas após limpeza: %s", len(working))
-    return working
+    _validate_columns(raw_rows)
+
+    cleaned: list[dict[str, float | str]] = []
+    for row in raw_rows:
+        canal = str(row.get("Canal", "")).strip()
+        investimento_raw = str(row.get("Investimento", "")).strip().replace(".", "").replace(",", ".")
+
+        if not canal or not investimento_raw:
+            continue
+
+        try:
+            investimento = float(investimento_raw)
+        except ValueError:
+            continue
+
+        if investimento < 0:
+            raise ValueError("Foram encontrados valores negativos de investimento.")
+
+        cleaned.append({"Canal": canal, "Investimento": investimento})
+
+    if not cleaned:
+        raise ValueError("Não há dados válidos após limpeza da base.")
+
+    logging.info("Linhas válidas após limpeza: %s", len(cleaned))
+    return cleaned
 
 
-def build_channel_ranking(df: pd.DataFrame) -> pd.DataFrame:
-    ranking = (
-        df.groupby("Canal", as_index=False)["Investimento"]
-        .sum()
-        .sort_values("Investimento", ascending=False)
-        .reset_index(drop=True)
-    )
+def build_channel_ranking(rows: Iterable[dict[str, float | str]]) -> list[RankingRow]:
+    totals: dict[str, float] = defaultdict(float)
+    for row in rows:
+        totals[str(row["Canal"])] += float(row["Investimento"])
 
-    total = ranking["Investimento"].sum()
+    ordered = sorted(totals.items(), key=lambda item: item[1], reverse=True)
+    total = sum(value for _, value in ordered)
     if total <= 0:
         raise ValueError("A soma total de investimento deve ser maior que zero.")
 
-    ranking["Share"] = ranking["Investimento"] / total
-    ranking["Share_Percentual"] = ranking["Share"] * 100
-    ranking["Investimento_Acumulado"] = ranking["Investimento"].cumsum()
-    ranking["Share_Acumulado"] = ranking["Share"].cumsum()
+    ranking: list[RankingRow] = []
+    invest_acum = 0.0
+    share_acum = 0.0
+
+    for canal, investimento in ordered:
+        share = investimento / total
+        invest_acum += investimento
+        share_acum += share
+        ranking.append(
+            RankingRow(
+                canal=canal,
+                investimento=investimento,
+                share=share,
+                share_percentual=share * 100,
+                investimento_acumulado=invest_acum,
+                share_acumulado=share_acum,
+            )
+        )
     return ranking
 
 
-def compute_kpis(ranking: pd.DataFrame) -> KPIBundle:
-    top_row = ranking.iloc[0]
-    hhi = float((ranking["Share"] ** 2).sum())
-
+def compute_kpis(ranking: list[RankingRow]) -> KPIBundle:
+    top = ranking[0]
+    total = sum(item.investimento for item in ranking)
+    media = total / len(ranking)
+    hhi = sum(item.share**2 for item in ranking)
     return KPIBundle(
-        total_investimento=float(ranking["Investimento"].sum()),
-        canais_ativos=int(ranking["Canal"].nunique()),
-        investimento_medio_por_canal=float(ranking["Investimento"].mean()),
-        top_canal=str(top_row["Canal"]),
-        top_canal_investimento=float(top_row["Investimento"]),
-        top_canal_share=float(top_row["Share"]),
+        total_investimento=total,
+        canais_ativos=len(ranking),
+        investimento_medio_por_canal=media,
+        top_canal=top.canal,
+        top_canal_investimento=top.investimento,
+        top_canal_share=top.share,
         hhi_concentracao=hhi,
     )
 
 
-def save_table_outputs(clean_df: pd.DataFrame, ranking_df: pd.DataFrame, kpis: KPIBundle, output_dir: Path) -> ReportArtifacts:
+def save_csv_dicts(path: Path, rows: list[dict[str, object]], headers: list[str]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def save_table_outputs(clean_rows: list[dict[str, float | str]], ranking: list[RankingRow], kpis: KPIBundle, output_dir: Path) -> ReportArtifacts:
     base_processada_csv = output_dir / "base_processada.csv"
     ranking_canais_csv = output_dir / "ranking_canais.csv"
     kpis_json = output_dir / "kpis_resumo.json"
     kpis_csv = output_dir / "kpis_resumo.csv"
 
-    clean_df.to_csv(base_processada_csv, index=False)
-    ranking_df.to_csv(ranking_canais_csv, index=False)
+    save_csv_dicts(base_processada_csv, clean_rows, ["Canal", "Investimento"])
+    save_csv_dicts(
+        ranking_canais_csv,
+        [asdict(item) for item in ranking],
+        ["canal", "investimento", "share", "share_percentual", "investimento_acumulado", "share_acumulado"],
+    )
 
     with kpis_json.open("w", encoding="utf-8") as fp:
         json.dump(asdict(kpis), fp, ensure_ascii=False, indent=2)
 
-    pd.DataFrame([asdict(kpis)]).to_csv(kpis_csv, index=False)
+    save_csv_dicts(kpis_csv, [asdict(kpis)], list(asdict(kpis).keys()))
 
     return ReportArtifacts(
         base_processada_csv=base_processada_csv,
@@ -147,16 +236,11 @@ def save_table_outputs(clean_df: pd.DataFrame, ranking_df: pd.DataFrame, kpis: K
     )
 
 
-def save_pie_chart(ranking: pd.DataFrame, title: str, output_path: Path) -> None:
+def save_pie_chart(ranking: list[RankingRow], title: str, output_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(10, 6))
-    labels = [f"{canal} ({share:.1%})" for canal, share in zip(ranking["Canal"], ranking["Share"]) ]
-    ax.pie(
-        ranking["Investimento"],
-        labels=labels,
-        autopct="%1.1f%%",
-        startangle=90,
-        counterclock=False,
-    )
+    labels = [f"{item.canal} ({item.share:.1%})" for item in ranking]
+    values = [item.investimento for item in ranking]
+    ax.pie(values, labels=labels, autopct="%1.1f%%", startangle=90, counterclock=False)
     ax.set_title(title)
     ax.axis("equal")
     plt.tight_layout()
@@ -164,17 +248,17 @@ def save_pie_chart(ranking: pd.DataFrame, title: str, output_path: Path) -> None
     plt.close(fig)
 
 
-def save_bar_chart(ranking: pd.DataFrame, title: str, output_path: Path) -> None:
+def save_bar_chart(ranking: list[RankingRow], title: str, output_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(11, 6))
-    ax.bar(ranking["Canal"], ranking["Investimento"], color="#4472C4")
+    channels = [item.canal for item in ranking]
+    values = [item.investimento for item in ranking]
+    ax.bar(channels, values, color="#4472C4")
     ax.set_title(f"{title} - Investimento Absoluto")
     ax.set_xlabel("Canal")
     ax.set_ylabel("Investimento")
     ax.tick_params(axis="x", rotation=30)
-
-    for idx, value in enumerate(ranking["Investimento"]):
+    for idx, value in enumerate(values):
         ax.text(idx, value, f"{value:,.0f}", ha="center", va="bottom", fontsize=9)
-
     plt.tight_layout()
     fig.savefig(output_path, dpi=220)
     plt.close(fig)
@@ -183,7 +267,6 @@ def save_bar_chart(ranking: pd.DataFrame, title: str, output_path: Path) -> None
 def add_kpi_slide(presentation: Presentation, kpis: KPIBundle, campaign: str, period: str) -> None:
     slide = presentation.slides.add_slide(presentation.slide_layouts[5])
     slide.shapes.title.text = "Resumo Executivo de KPIs"
-
     box = slide.shapes.add_textbox(Inches(0.8), Inches(1.4), Inches(12.0), Inches(4.8))
     tf = box.text_frame
     tf.word_wrap = True
@@ -210,19 +293,11 @@ def add_chart_slide(presentation: Presentation, title: str, image_path: Path) ->
     slide.shapes.add_picture(str(image_path), Inches(0.8), Inches(1.4), width=Inches(11.7))
 
 
-def save_ppt(
-    chart_pie_path: Path,
-    chart_bar_path: Path,
-    title: str,
-    campaign: str,
-    period: str,
-    kpis: KPIBundle,
-    output_path: Path,
-) -> None:
+def save_ppt(pie_path: Path, bar_path: Path, title: str, campaign: str, period: str, kpis: KPIBundle, output_path: Path) -> None:
     presentation = Presentation()
     add_kpi_slide(presentation, kpis, campaign, period)
-    add_chart_slide(presentation, title, chart_pie_path)
-    add_chart_slide(presentation, f"{title} - Visão Absoluta", chart_bar_path)
+    add_chart_slide(presentation, title, pie_path)
+    add_chart_slide(presentation, f"{title} - Visão Absoluta", bar_path)
     presentation.save(output_path)
 
 
@@ -230,20 +305,20 @@ def main() -> None:
     args = parse_args()
     setup_logging(args.log_level)
 
-    excel_path = Path(args.input)
+    input_path = Path(args.input)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not excel_path.exists():
-        raise FileNotFoundError(f"Arquivo não encontrado: {excel_path}")
+    if not input_path.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {input_path}")
 
-    clean_df = load_and_validate_data(excel_path, args.sheet)
-    ranking_df = build_channel_ranking(clean_df)
-    kpis = compute_kpis(ranking_df)
-    artifacts = save_table_outputs(clean_df, ranking_df, kpis, output_dir)
+    clean_rows = load_and_validate_data(input_path, args.sheet)
+    ranking = build_channel_ranking(clean_rows)
+    kpis = compute_kpis(ranking)
+    artifacts = save_table_outputs(clean_rows, ranking, kpis, output_dir)
 
-    save_pie_chart(ranking_df, args.title, artifacts.grafico_pizza_png)
-    save_bar_chart(ranking_df, args.title, artifacts.grafico_barras_png)
+    save_pie_chart(ranking, args.title, artifacts.grafico_pizza_png)
+    save_bar_chart(ranking, args.title, artifacts.grafico_barras_png)
     save_ppt(
         artifacts.grafico_pizza_png,
         artifacts.grafico_barras_png,
